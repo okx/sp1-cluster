@@ -1,0 +1,300 @@
+{
+  "version": "1",
+  "generated_at": "2026-05-20 19:01:43",
+  "generated_by": "kai.zhang@okg.com",
+  "repo": {
+    "name": "sp1-cluster",
+    "remote_url": "git@gitlab.okg.com:github/sp1-cluster.git",
+    "branch": "zhangkai/context-kg"
+  },
+  "stack_hint": {
+    "primary_language": "rust",
+    "frameworks": [
+      "tonic 0.12.3",
+      "axum 0.8.4",
+      "tokio 1.45.0",
+      "sqlx 0.8.5 (postgres)",
+      "aws-sdk-s3 1.84.0",
+      "deadpool-redis 0.22.0",
+      "opentelemetry 0.23.0",
+      "tracing 0.1.41",
+      "clap 4.4",
+      "prost 0.13.5",
+      "alloy 1.1.3",
+      "sp1-sdk 6.2.0"
+    ],
+    "runtime": "rustc nightly-2025-10-15 (edition 2021)",
+    "polyglot": {
+      "rust": "77",
+      "yaml": "31",
+      "toml": "14",
+      "yml": "8",
+      "sql": "4"
+    }
+  },
+  "core_functions": [
+    "sp1_proof_request_lifecycle",
+    "cluster_coordinator_scheduling",
+    "worker_task_dispatch",
+    "spn_network_fulfillment",
+    "spn_network_bidding",
+    "sdk_compatible_gateway",
+    "artifact_storage_s3_redis",
+    "artifact_admission_control",
+    "balanced_assignment_policy",
+    "stark_recursion_pipeline",
+    "groth16_plonk_wrapping",
+    "execution_only_mode",
+    "vkey_map_generation",
+    "deterministic_program_caching",
+    "private_stdin_routing"
+  ],
+  "core_business": "Multi-GPU SP1 proving cluster for cloud/bare-metal. Accepts proof requests via SDK gateway or cluster API, persists them in Postgres, schedules tasks (Controller, ProveShard, CoreExecute, Recursion, Shrink/Plonk/Groth16Wrap) across GPU/CPU workers via a balanced policy, stores artifacts in S3 (persistent) or Redis (ephemeral with admission). Bridges the cluster to the Succinct Prover Network via fulfiller (submit/fail/cancel/schedule) and bidder for mainnet operations.",
+  "core_modules": [
+    {
+      "path": "bin/api",
+      "role": "core_business_module",
+      "description": "Hosts ClusterService gRPC for proof_request CRUD backed by Postgres (sqlx); the sole owner of cluster DB connectivity; serves HTTP /healthz on API_HTTP_ADDR.",
+      "sub_modules": [
+        {
+          "path": "bin/api/src/service.rs",
+          "function": "ClusterServiceImpl — proof_request_create/cancel/update/get/list via sqlx::PgPool",
+          "key_components": ["ClusterServiceImpl", "DbProofRequest", "ClusterService"]
+        },
+        {
+          "path": "bin/api/src/main.rs",
+          "function": "Boot: PgPool, optional sqlx migrations on API_AUTO_MIGRATE=true, tonic gRPC + tonic-web, axum HTTP",
+          "key_components": ["PgPool", "tonic_web", "axum::serve"]
+        }
+      ]
+    },
+    {
+      "path": "bin/coordinator",
+      "role": "core_business_module",
+      "description": "In-memory cluster scheduler — owns Coordinator<P>, hosts WorkerService gRPC, dispatches tasks to workers, polls bin/api via ClusterServiceClient.",
+      "sub_modules": [
+        {
+          "path": "bin/coordinator/src/lib.rs",
+          "function": "Coordinator<P>: proofs/tasks/workers state, create_proof, create_task_internal, complete_task, fail_task, fail_proof_internal",
+          "key_components": ["Coordinator", "MAX_TASK_RETRIES", "WORKER_HEARTBEAT_TIMEOUT", "enable_proof_fail"]
+        },
+        {
+          "path": "bin/coordinator/src/server.rs",
+          "function": "GenericWorkerService: WorkerService gRPC impl with jemalloc + tcp/http2 keepalive + tonic-web; spawns proof status/claimer/heartbeat/periodic tasks",
+          "key_components": ["GenericWorkerService", "spawn_subscriber_channel_task"]
+        },
+        {
+          "path": "bin/coordinator/src/cluster.rs",
+          "function": "Glue to bin/api: spawn_proof_status_task forwards ProofResult to ProofRequestUpdate; spawn_proof_claimer_task polls for Pending+!handled rows",
+          "key_components": ["spawn_proof_claimer_task", "spawn_proof_status_task", "ControllerInputMetadata"]
+        },
+        {
+          "path": "bin/coordinator/src/policy",
+          "function": "AssignmentPolicy implementations — BalancedPolicy (default), DefaultPolicy",
+          "key_components": ["AssignmentPolicy", "BalancedPolicy", "DefaultPolicy", "QueuedTask"]
+        }
+      ]
+    },
+    {
+      "path": "bin/node",
+      "role": "core_business_module",
+      "description": "CPU or GPU worker process — selects artifact backend (s3/redis), connects to coordinator over gRPC streaming, dispatches NewTask to SP1ClusterWorker::run_task; drains on shutdown (DRAIN_TIMEOUT=30min); aborts tasks > TASK_TIMEOUT=6h.",
+      "sub_modules": [
+        {
+          "path": "bin/node/src/main.rs",
+          "function": "Bootstrap, artifact backend selection, circuit pre-install for CPU, main worker loop, heartbeat, drain",
+          "key_components": ["run_worker", "TASK_TIMEOUT", "DRAIN_TIMEOUT", "WorkerType"]
+        }
+      ]
+    },
+    {
+      "path": "bin/fulfiller",
+      "role": "core_business_module",
+      "description": "SPN ↔ cluster sync binary — wires Fulfiller (run loop submit/fail/cancel/schedule) over a chosen artifact backend and MainnetFulfiller.",
+      "sub_modules": [
+        {
+          "path": "bin/fulfiller/src/main.rs",
+          "function": "Bootstrap: rustls ring, ProverNetworkClient, artifact backend dispatch, run_fulfiller",
+          "key_components": ["MainnetFulfiller", "ProverNetworkClient"]
+        },
+        {
+          "path": "bin/fulfiller/src/mainnet.rs",
+          "function": "FulfillmentNetwork impl: submit_request (FulfillProofRequestBody), get_cancelable_requests (parallel Assigned+Unexecutable / Unfulfillable queries), fail_request_with_error",
+          "key_components": ["MainnetFulfiller", "VK_MISMATCH_ERROR", "VK_MISMATCH_STRINGS"]
+        }
+      ]
+    },
+    {
+      "path": "bin/bidder",
+      "role": "core_business_module",
+      "description": "SPN bid loop — polls every 3s, evaluates capacity + per-mode toggles, signs BidRequestBody with local PrivateKeySigner.",
+      "sub_modules": [
+        {
+          "path": "bin/bidder/src/lib.rs",
+          "function": "Bidder::run bid_requests with biddable-before-assigned ordering; can_fulfill_proof capacity logic",
+          "key_components": ["Bidder", "REFRESH_INTERVAL_SEC", "aggressive_mode"]
+        },
+        {
+          "path": "bin/bidder/src/grpc.rs",
+          "function": "configure_endpoint mirroring crates/fulfillment constants",
+          "key_components": ["configure_endpoint"]
+        }
+      ]
+    },
+    {
+      "path": "bin/network-gateway",
+      "role": "core_business_module",
+      "description": "SDK-compatible ProverNetwork + ArtifactStore gRPC gateway; HTTP artifact proxy; durable ProgramStore (fs/memory); auth via EIP-191.",
+      "sub_modules": [
+        {
+          "path": "bin/network-gateway/src/service",
+          "function": "ProverNetworkImpl + ArtifactStoreImpl over ClusterServiceClient + ArtifactClient",
+          "key_components": ["ProverNetworkImpl", "ArtifactStoreImpl"]
+        },
+        {
+          "path": "bin/network-gateway/src/ids.rs",
+          "function": "URI / id minting and round-trip: mint_request_id (32-byte), proof_id_from_request_id, program_artifact_id (vk_hash deterministic), artifact_type_segment",
+          "key_components": ["mint_request_id", "program_artifact_id", "artifact_type_segment"]
+        },
+        {
+          "path": "bin/network-gateway/src/auth.rs",
+          "function": "Auth modes None/Verify/Allowlist — EIP-191 signature recovery for create_program/request_proof/create_artifact",
+          "key_components": ["Auth", "AuthMode"]
+        },
+        {
+          "path": "bin/network-gateway/src/program_store.rs",
+          "function": "Durable program registry — FilesystemProgramStore (.tmp + rename) or InMemoryProgramStore",
+          "key_components": ["ProgramStore", "FilesystemProgramStore", "InMemoryProgramStore"]
+        },
+        {
+          "path": "bin/network-gateway/src/status.rs",
+          "function": "Cluster proto ↔ SDK proto enum mapping (fulfillment_from_cluster, execution_from_cluster, cluster_*_filter)",
+          "key_components": ["fulfillment_from_cluster", "cluster_fulfillment_filter"]
+        }
+      ]
+    },
+    {
+      "path": "bin/cli",
+      "role": "core_business_module",
+      "description": "Developer CLI — bench + vk-gen subcommands; uses crates/utils request_proof helpers; not part of runtime data plane.",
+      "sub_modules": [
+        {
+          "path": "bin/cli/src/commands",
+          "function": "bench, vk_gen subcommands",
+          "key_components": ["bench", "vk_gen"]
+        }
+      ]
+    },
+    {
+      "path": "crates/artifact",
+      "role": "shared_library",
+      "description": "ArtifactClient + CompressedUpload backends — S3 (zstd lvl 3, 32 MiB multipart) and Redis (zstd lvl 0, sharded deadpool-redis, admission control with #[must_use] AdmissionGuard).",
+      "sub_modules": [
+        {
+          "path": "crates/artifact/src/s3.rs",
+          "function": "S3ArtifactClient with S3DownloadMode::AwsSDK | REST transport adapters",
+          "key_components": ["S3ArtifactClient", "S3DownloadMode", "par_upload_file", "par_download_file"]
+        },
+        {
+          "path": "crates/artifact/src/redis.rs",
+          "function": "RedisArtifactClient + admission control + ShardPermit + refcount via refs:{id}",
+          "key_components": ["RedisArtifactClient", "AdmissionGuard", "ShardPermit", "validate_config"]
+        },
+        {
+          "path": "crates/artifact/tests",
+          "function": "Admission and ProveShardGate integration tests verifying TOCTOU + OOM guarantees",
+          "key_components": ["admission.rs", "prove_shard_gate.rs"]
+        }
+      ]
+    },
+    {
+      "path": "crates/common",
+      "role": "shared_library",
+      "description": "Cross-binary shared infrastructure — proto re-exports, ClusterServiceClient, logger (OTLP), task_weight consts, backoff_retry helpers.",
+      "sub_modules": [
+        {
+          "path": "crates/common/src/client.rs",
+          "function": "ClusterServiceClient + reconnect_with_backoff helper",
+          "key_components": ["ClusterServiceClient", "reconnect_with_backoff"]
+        },
+        {
+          "path": "crates/common/src/util.rs",
+          "function": "backoff_retry + status_to_backoff_error + BackoffError trait + get_private_ip",
+          "key_components": ["backoff_retry", "status_to_backoff_error", "BackoffError", "NoopNotify"]
+        },
+        {
+          "path": "crates/common/src/logger.rs",
+          "function": "OpenTelemetry + tracing_subscriber init (Once-guarded)",
+          "key_components": ["logger::init"]
+        },
+        {
+          "path": "crates/common/src/consts.rs",
+          "function": "task_weight + WORKER_*_WEIGHT env-tunable lazy_statics",
+          "key_components": ["task_weight", "CONTROLLER_WEIGHT", "GROTH16_WRAP_WEIGHT", "PLONK_WRAP_WEIGHT"]
+        }
+      ]
+    },
+    {
+      "path": "crates/fulfillment",
+      "role": "shared_library",
+      "description": "Fulfiller primitives + FulfillmentNetwork trait — used by bin/fulfiller and any executor binary.",
+      "sub_modules": [
+        {
+          "path": "crates/fulfillment/src/lib.rs",
+          "function": "Fulfiller<A,N>: submit_requests / fail_requests / cancel_requests / schedule_requests loop",
+          "key_components": ["Fulfiller", "REQUEST_LIMIT"]
+        },
+        {
+          "path": "crates/fulfillment/src/network.rs",
+          "function": "FulfillmentNetwork + NetworkRequest traits; should_download_proofs default true",
+          "key_components": ["FulfillmentNetwork", "NetworkRequest"]
+        },
+        {
+          "path": "crates/fulfillment/src/grpc.rs",
+          "function": "configure_endpoint helper for SPN-side gRPC",
+          "key_components": ["configure_endpoint"]
+        }
+      ]
+    },
+    {
+      "path": "crates/utils",
+      "role": "shared_library",
+      "description": "High-level request_proof helpers used by bin/cli — uploads artifacts, polls get_proof_request, downloads completed proof.",
+      "sub_modules": [
+        {
+          "path": "crates/utils/src/lib.rs",
+          "function": "request_proof helpers for CLI-style flows",
+          "key_components": ["request_proof"]
+        }
+      ]
+    },
+    {
+      "path": "crates/worker",
+      "role": "shared_library",
+      "description": "SP1ClusterWorker — dispatches TaskType to per-task handlers in src/tasks/; WorkerServiceClient with explicit per-call retry budgets; OpenTelemetry context propagation.",
+      "sub_modules": [
+        {
+          "path": "crates/worker/src/lib.rs",
+          "function": "SP1ClusterWorker::run_task dispatching TaskType to handlers",
+          "key_components": ["SP1ClusterWorker", "ClusterProverComponents", "try_unclaim_proof"]
+        },
+        {
+          "path": "crates/worker/src/client.rs",
+          "function": "WorkerServiceClient (gRPC) + retry::infinite/bounded module",
+          "key_components": ["WorkerServiceClient", "retry::infinite", "retry::bounded"]
+        },
+        {
+          "path": "crates/worker/src/tasks",
+          "function": "Per-task handlers: controller, core_execute, execute_only, finalize (Plonk/Groth16), prove_shard, recursion, setup, shrink_wrap, vk_gen",
+          "key_components": ["process_sp1_controller", "process_sp1_prove_shard", "process_sp1_finalize", "CoreBatchData", "DeferredBatchData", "ReduceBatchData"]
+        },
+        {
+          "path": "crates/worker/src/limiter.rs",
+          "function": "get_max_weight from sys_info + WORKER_MAX_WEIGHT_OVERRIDE",
+          "key_components": ["get_max_weight"]
+        }
+      ]
+    }
+  ],
+  "summary": "Rust backend (7 bins + 5 crates): multi-GPU SP1 proving cluster — gRPC API on Postgres, coordinator scheduling GPU/CPU workers, S3+Redis artifacts, SDK gateway, SPN fulfiller and bidder."
+}
